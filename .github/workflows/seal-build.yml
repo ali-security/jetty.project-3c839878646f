@@ -1,0 +1,180 @@
+name: seal-build
+
+# Upstream jetty 9.2.x has no GitHub Actions CI; it built on Jenkins (Jenkinsfile:
+# jdk7 + maven3, `mvn -B clean install`). This workflow mirrors that on JDK 7,
+# scoped to the jetty-io artifact and the modules whose tests cover it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MAVEN_VERSION: 3.8.8
+      MAVEN_OPTS: -Xms256m -Xmx2g -XX:MaxPermSize=512m -Djava.awt.headless=true -Dhttps.protocols=TLSv1.2
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-java no longer offers Java 7 for any distribution, so fetch Zulu 7 directly.
+      - name: Set up JDK 7 (release Build-Jdk 1.7.0_75)
+        run: |
+          ZULU=zulu7.56.0.11-ca-jdk7.0.352-linux_x64
+          mkdir -p "$RUNNER_TEMP/jdk7"
+          curl -fsSL "https://cdn.azul.com/zulu/bin/${ZULU}.tar.gz" | tar xz --strip-components=1 -C "$RUNNER_TEMP/jdk7"
+          J8_CACERTS="${JAVA_HOME_8_X64:-/nonexistent}/jre/lib/security/cacerts"
+          if [ -f "$J8_CACERTS" ] && "$RUNNER_TEMP/jdk7/bin/keytool" -list -keystore "$J8_CACERTS" -storepass changeit >/dev/null 2>&1; then
+            cp "$J8_CACERTS" "$RUNNER_TEMP/jdk7/jre/lib/security/cacerts"
+            echo "using runner JDK 8 cacerts"
+          fi
+          # Zulu 7u352 ships 2022-era crypto policy (MD5withRSA certs and TLSv1/1.1 disabled).
+          # The 9.2.x test keystores use an MD5withRSA/1024-bit cert and TLSv1, which the
+          # release JDK (Oracle 1.7.0_75) accepted; restore that JDK's policy.
+          python3 - "$RUNNER_TEMP/jdk7/jre/lib/security/java.security" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          want = {
+              'jdk.certpath.disabledAlgorithms': 'MD2, RSA keySize < 1024',
+              'jdk.tls.disabledAlgorithms': 'SSLv3',
+          }
+          out, skip = [], False
+          for line in open(p).read().splitlines():
+              if skip:
+                  skip = line.rstrip().endswith('\\')
+                  continue
+              key = line.split('=', 1)[0].strip()
+              if key in want:
+                  skip = line.rstrip().endswith('\\')
+                  continue
+              out.append(line)
+          out += ['%s=%s' % kv for kv in want.items()]
+          open(p, 'w').write('\n'.join(out) + '\n')
+          EOF
+          grep -n "disabledAlgorithms" "$RUNNER_TEMP/jdk7/jre/lib/security/java.security"
+          echo "JAVA_HOME=$RUNNER_TEMP/jdk7" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/jdk7/bin" >> "$GITHUB_PATH"
+
+      - name: Install Maven ${{ env.MAVEN_VERSION }}
+        run: |
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Maven settings (jenkins-ci repo for jetty-version-maven-plugin parent poms)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <profiles>
+              <profile>
+                <id>jenkins-ci</id>
+                <activation><activeByDefault>true</activeByDefault></activation>
+                <repositories>
+                  <repository>
+                    <id>jenkins-ci</id>
+                    <url>https://repo.jenkins-ci.org/public/</url>
+                    <snapshots><enabled>false</enabled></snapshots>
+                  </repository>
+                </repositories>
+                <pluginRepositories>
+                  <pluginRepository>
+                    <id>jenkins-ci</id>
+                    <url>https://repo.jenkins-ci.org/public/</url>
+                    <snapshots><enabled>false</enabled></snapshots>
+                  </pluginRepository>
+                </pluginRepositories>
+              </profile>
+            </profiles>
+          </settings>
+          EOF
+
+      - name: Build and test (mvn clean install)
+        run: |
+          java -version
+          mvn -version
+          MODULES=jetty-io,jetty-server,jetty-websocket/websocket-client
+          SKIPS="-Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dsource.skip=true -Dcheckstyle.skip=true -Denforcer.skip=true -Dgpg.skip=true -Dlicense.skip=true -Dfindbugs.skip=true"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B -V -e clean install -pl "$MODULES" -am $SKIPS -Dtest="${{ inputs.test-filter }}" -DfailIfNoTests=false
+          else
+            mvn -B -V -e clean install -pl "$MODULES" -am $SKIPS
+          fi
+
+      - name: Surefire summary (per-test skip reasons and totals)
+        if: always()
+        shell: python
+        run: |
+          import glob, os, re
+          import xml.etree.ElementTree as ET
+          tot = dict(tests=0, failures=0, errors=0, skipped=0)
+          skips, fails = [], []
+          for f in sorted(glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True)):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception as e:
+                  print('unparseable report', f, e)
+                  continue
+              mod = f.split('/target/')[0]
+              for k in tot:
+                  tot[k] += int(root.get(k, 0) or 0)
+              for tc in root.iter('testcase'):
+                  cls, name = tc.get('classname'), tc.get('name')
+                  sk = tc.find('skipped')
+                  if sk is not None:
+                      skips.append((mod, cls, name, (sk.get('message') or '').strip()))
+                  for tag in ('failure', 'error'):
+                      el = tc.find(tag)
+                      if el is not None:
+                          fails.append((mod, cls, name, tag, (el.get('message') or '')[:300]))
+
+          def source_reason(mod, cls, name):
+              base = re.sub(r'\[.*\]$', '', name or '')
+              path = os.path.join(mod, 'src/test/java', cls.replace('.', '/') + '.java')
+              if not os.path.exists(path):
+                  return []
+              lines = open(path, encoding='utf-8', errors='replace').read().splitlines()
+              out = []
+              for i, l in enumerate(lines):
+                  if re.match(r'\s*@(Ignore|Stress|Slow)', l) and 'class ' in ''.join(lines[i:i+4]):
+                      out.append('class-level: ' + l.strip())
+              for i, l in enumerate(lines):
+                  if re.search(r'void\s+' + re.escape(base) + r'\s*\(', l):
+                      for c in lines[max(0, i-5):i+9]:
+                          if re.search(r'@Ignore|@Stress|@Slow|assume|Assume', c):
+                              out.append(c.strip())
+                      break
+              return out
+
+          print('=' * 72)
+          print('SKIPPED TESTS (%d)' % len(skips))
+          for mod, cls, name, msg in skips:
+              print('SKIPPED: %s#%s [%s]' % (cls, name, mod))
+              reasons = source_reason(mod, cls, name)
+              if msg:
+                  print('    surefire message: ' + msg)
+              for r in reasons:
+                  print('    source: ' + r)
+              if any('@Stress' in r for r in reasons):
+                  print('    note: @Stress tests are opt-in via -Dtest.stress=true (jetty-test-helper PropertyFlag)')
+              if not msg and not reasons:
+                  print('    reason: upstream @Ignore/assumption (no message recorded)')
+          print('=' * 72)
+          for mod, cls, name, tag, msg in fails:
+              print('%s: %s#%s [%s] %s' % (tag.upper(), cls, name, mod, msg))
+          passed = tot['tests'] - tot['failures'] - tot['errors'] - tot['skipped']
+          print('TOTAL: run=%d passed=%d failures=%d errors=%d skipped=%d'
+                % (tot['tests'], passed, tot['failures'], tot['errors'], tot['skipped']))
+
+      - name: Upload jetty-io jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-io
+          path: jetty-io/target/jetty-io-9.2.24.v20180105.jar
+          if-no-files-found: error
