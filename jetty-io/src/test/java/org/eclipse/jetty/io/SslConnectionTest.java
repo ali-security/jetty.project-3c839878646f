@@ -23,11 +23,13 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.Socket;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -58,6 +60,7 @@ public class SslConnectionTest
 
     protected volatile EndPoint _lastEndp;
     private volatile boolean _testFill=true;
+    private volatile int _inputBufferSize=8*1024;
     private volatile FutureCallback _writeCallback;
     protected ServerSocketChannel _connector;
     final AtomicInteger _dispatches = new AtomicInteger();
@@ -143,6 +146,7 @@ public class SslConnectionTest
     public void startManager() throws Exception
     {
         _testFill=true;
+        _inputBufferSize=8*1024;
         _writeCallback=null;
         _lastEndp=null;
         _connector = ServerSocketChannel.open();
@@ -166,7 +170,7 @@ public class SslConnectionTest
 
     public class TestConnection extends AbstractConnection
     {
-        ByteBuffer _in = BufferUtil.allocate(8*1024);
+        ByteBuffer _in = BufferUtil.allocate(_inputBufferSize);
 
         public TestConnection(EndPoint endp)
         {
@@ -385,6 +389,62 @@ public class SslConnectionTest
         Assert.assertTrue(count.await(20,TimeUnit.SECONDS));
         client.close();
 
+    }
+
+    @Test
+    public void testInvalidLargeTLSFrame() throws Exception
+    {
+        // Use an application input buffer larger than the SSLEngine application buffer,
+        // so that the SSLEngine reports BUFFER_UNDERFLOW (rather than BUFFER_OVERFLOW)
+        // for the oversized TLS record while the encrypted input buffer is full.
+        _inputBufferSize=64*1024;
+
+        try (Socket client = new Socket())
+        {
+            client.connect(_connector.socket().getLocalSocketAddress());
+
+            SocketChannel server = _connector.accept();
+            server.configureBlocking(false);
+            _manager.accept(server);
+
+            // Create raw TLS record with invalid large length (20,000 bytes).
+            byte[] bytes = new byte[20005];
+            Arrays.fill(bytes, (byte)1);
+
+            bytes[0] = 22; // record type
+            bytes[1] = 3;  // major version
+            bytes[2] = 3;  // minor version
+            bytes[3] = 78; // record length 2 bytes / 0x4E20 / decimal 20,000
+            bytes[4] = 32; // record length
+            bytes[5] = 1;  // message type
+            bytes[6] = 0;  // message length 3 bytes / 0x004E17 / decimal 19,991
+            bytes[7] = 78;
+            bytes[8] = 23;
+
+            _dispatches.set(0);
+            client.getOutputStream().write(bytes);
+
+            // Sleep to see if the server spins (would indicate a bug).
+            Thread.sleep(1000);
+            Assert.assertTrue("server spinning on oversized TLS record: " + _dispatches.get() + " dispatches", _dispatches.get() < 128);
+
+            // The server must close the connection rather than wait for more encrypted bytes.
+            client.setSoTimeout(5000);
+            try
+            {
+                int read;
+                do
+                {
+                    read = client.getInputStream().read();
+                }
+                while (read >= 0);
+                Assert.assertEquals(-1, read);
+            }
+            catch (SocketException e)
+            {
+                // Connection reset by the server closing with unread bytes.
+            }
+        }
     }
 
 

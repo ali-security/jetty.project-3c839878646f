@@ -29,6 +29,7 @@ import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import javax.net.ssl.SSLEngineResult.Status;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLHandshakeException;
 
 import org.eclipse.jetty.io.AbstractConnection;
 import org.eclipse.jetty.io.AbstractEndPoint;
@@ -578,6 +579,19 @@ public class SslConnection extends AbstractConnection
                                 }
                             }
                             case BUFFER_UNDERFLOW:
+                                // Continue if we can compact?
+                                if (BufferUtil.compact(_encryptedInput))
+                                    break decryption; // to cause fill again.
+
+                                // Are we out of space?
+                                if (BufferUtil.space(_encryptedInput) == 0)
+                                {
+                                    BufferUtil.clear(_encryptedInput);
+                                    throw new SSLHandshakeException("Encrypted buffer max length exceeded");
+                                }
+
+                                _underFlown = true;
+                                // Fall through to OK case.
                             case OK:
                             {
                                 if (unwrapHandshakeStatus == HandshakeStatus.FINISHED && !_handshaken)
